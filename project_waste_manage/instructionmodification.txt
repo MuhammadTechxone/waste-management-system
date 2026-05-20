@@ -1,0 +1,410 @@
+
+Waste Management Backend
+Supplementary Engineering Specification
+Addendum to Core Backend Spec  •  v1.0  •  May 2026
+
+This document fills every gap identified in the core spec review: authentication, image upload, state transitions, duplicate detection thresholds, confidence score formula, API query parameters, clustering algorithm, and analytics metric definitions.
+
+1. Authentication & Authorization
+All admin-facing endpoints are protected by a Bearer token scheme enforced via a FastAPI dependency. User-facing read endpoints (/heatmap, /alerts, /reports) are public. No session state is maintained server-side.
+
+1.1 Token Strategy
+Endpoint group	Auth required	Mechanism
+POST /report	No	Public — any client may submit
+GET /reports	No	Public read
+GET /heatmap	No	Public read
+GET /alerts	No	Public read
+GET /admin/reports	Yes — Admin	Bearer token in Authorization header
+PATCH /report/{id}	Yes — Admin	Bearer token in Authorization header
+
+1.2 FastAPI Dependency
+Add the following dependency to every admin route. The token is loaded from an environment variable (ADMIN_API_KEY) stored in Hugging Face Spaces Secrets — never hard-coded.
+# utils/auth.py
+from fastapi import Security, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import os
+
+bearer = HTTPBearer()
+
+def verify_admin(creds: HTTPAuthorizationCredentials = Security(bearer)):
+    if creds.credentials != os.environ["ADMIN_API_KEY"]:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Invalid admin token")
+
+# Usage in route:
+# @router.get("/admin/reports")
+# def get_admin_reports(_, auth=Depends(verify_admin)):
+
+1.3 CORS Allowed Origins
+Configure allowed origins explicitly. Do not use wildcard (*) in production because the backend accepts image uploads.
+# main.py
+from fastapi.middleware.cors import CORSMiddleware
+
+ALLOWED_ORIGINS = [
+"https://<your-hf-space>.hf.space",   # HF Space frontend
+"https://<admin-dashboard>.hf.space",  # Streamlit admin
+"http://localhost:3000",               # Local dev frontend
+"http://localhost:8501",               # Local Streamlit
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
+2. Image Upload Specification
+2.1 Submission Format
+POST /report uses multipart/form-data. JSON fields are sent as form fields alongside the optional image file. This is the only format that supports file upload in a single HTTP request.
+# Form fields (all string except the file):
+latitude       float   required
+longitude      float   required
+location_name  string  required
+description    string  required
+severity       string  required  # Low | Medium | High | Critical
+image          file    optional  # multipart file upload
+
+# FastAPI route signature:
+async def submit_report(
+    latitude: float      = Form(...),
+    longitude: float     = Form(...),
+    location_name: str   = Form(...),
+    description: str     = Form(...),
+    severity: str        = Form(...),
+    image: UploadFile    = File(None),
+):
+
+2.2 Image Validation Rules
+Rule	Value	Action on violation
+Allowed MIME types	image/jpeg, image/png, image/webp	Return 422
+Maximum file size	5 MB	Return 413
+Minimum dimensions	200 × 200 px	Store but reduce confidence score by 5
+Filename	UUID4 + original extension	Renamed on ingest — never trust user filename
+
+2.3 Storage Path Convention
+# uploads/<YYYY-MM-DD>/<uuid4>.<ext>
+# Example: uploads/2026-05-18/f3a1c9d2-...jpg
+
+import uuid, os
+from datetime import date
+
+def save_image(file: UploadFile) -> str:
+    day_dir = f"uploads/{date.today().isoformat()}"
+    os.makedirs(day_dir, exist_ok=True)
+    ext = file.filename.rsplit(".", 1)[-1].lower()
+    filename = f"{uuid.uuid4()}.{ext}"
+    path = f"{day_dir}/{filename}"
+    with open(path, "wb") as f:
+        f.write(file.file.read())
+    return path
+Hugging Face Spaces does not guarantee persistent disk storage across restarts. For production, replace the local write above with an upload to Cloudflare R2 or AWS S3, and store the resulting object URL as image_path in the database.
+
+3. Incident State Transition Rules
+3.1 Legal Transitions
+state_manager.py must enforce this matrix. Any PATCH /report/{id} request that attempts an unlisted transition must return HTTP 409 Conflict with a descriptive error message.
+
+From state	Allowed next states	Who may trigger
+reported	verified, rejected, expired	System (auto-verify) or Admin
+verified	investigating, rejected	Admin only
+investigating	assigned, rejected	Admin only
+assigned	resolved, investigating	Admin only
+resolved	— terminal —	Nobody (immutable)
+rejected	— terminal —	Nobody (immutable)
+expired	— terminal —	Nobody (immutable)
+
+The assigned → investigating back-transition is intentional: it handles cases where a cleanup team is reassigned or the incident requires further review before resolution.
+
+3.2 State Manager Implementation
+# services/state_manager.py
+
+TRANSITIONS = {
+"reported":      {"verified", "rejected", "expired"},
+"verified":      {"investigating", "rejected"},
+"investigating": {"assigned", "rejected"},
+"assigned":      {"resolved", "investigating"},
+"resolved":      set(),
+"rejected":      set(),
+"expired":       set(),
+}
+
+def transition(report, new_state: str, db) -> None:
+    allowed = TRANSITIONS.get(report.state, set())
+    if new_state not in allowed:
+        raise ValueError(
+            f"Cannot move from {report.state!r} to {new_state!r}. "
+            f"Allowed: {sorted(allowed) or ['none — terminal state']}"
+        )
+    report.state = new_state
+    report.updated_at = datetime.utcnow()
+    db.commit()
+
+3.3 Auto-Expiry Background Job
+Reports in reported or verified state for more than 30 days are automatically transitioned to expired by a scheduled background task. This prevents stale hotspot inflation.
+# services/state_manager.py (continued)
+from apscheduler.schedulers.background import BackgroundScheduler
+from datetime import datetime, timedelta
+
+EXPIRY_DAYS = 30
+EXPIRY_ELIGIBLE = {"reported", "verified"}
+
+def expire_stale_reports(db):
+    cutoff = datetime.utcnow() - timedelta(days=EXPIRY_DAYS)
+    stale = db.query(Report).filter(
+        Report.state.in_(EXPIRY_ELIGIBLE),
+        Report.created_at < cutoff
+    ).all()
+    for r in stale:
+        r.state = "expired"
+        r.updated_at = datetime.utcnow()
+    db.commit()
+
+# Register in main.py on startup:
+# scheduler = BackgroundScheduler()
+# scheduler.add_job(expire_stale_reports, "interval", hours=6, args=[next(get_db())])
+# scheduler.start()
+
+4. Duplicate Detection — Concrete Thresholds
+4.1 Detection Rules
+Rule	Threshold	Condition
+Proximity + recency	Within 50 metres AND within 24 hours	Flag as duplicate if any existing unresolved report matches both
+Image hash match	Exact MD5 hash match	Flag as duplicate regardless of location or time
+Description similarity	≥ 85% Jaccard token overlap	Flag as potential duplicate; human review recommended
+
+4.2 Operational Behaviour on Detection
+A flagged duplicate is still stored in the database with is_duplicate = True. It is NOT auto-rejected. Duplicates are excluded from heatmap weight calculation but remain visible to admins. This preserves evidence and supports confidence boosting for the original report.
+
+4.3 Implementation
+# services/verification.py
+import hashlib
+
+PROXIMITY_METRES = 50
+RECENCY_HOURS    = 24
+
+def haversine_metres(lat1, lon1, lat2, lon2) -> float:
+    # Standard haversine formula — returns distance in metres
+    R = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
+    return 2 * R * math.asin(math.sqrt(a))
+
+def is_proximity_duplicate(lat, lon, db) -> bool:
+    cutoff = datetime.utcnow() - timedelta(hours=RECENCY_HOURS)
+    recent = db.query(Report).filter(
+        Report.created_at >= cutoff,
+        Report.is_duplicate == False,
+        Report.state != "rejected"
+    ).all()
+    return any(
+        haversine_metres(lat, lon, r.latitude, r.longitude) <= PROXIMITY_METRES
+        for r in recent
+    )
+
+def image_hash(file_bytes: bytes) -> str:
+    return hashlib.md5(file_bytes).hexdigest()
+
+def is_hash_duplicate(file_bytes: bytes, db) -> bool:
+    h = image_hash(file_bytes)
+    return db.query(Report).filter(Report.image_hash == h).count() > 0
+
+5. Confidence Score Formula
+5.1 Scoring Table
+The confidence score starts at a base of 50 and is adjusted by the factors below. The result is clamped to the range [0, 100].
+
+Factor	Delta	Notes
+Base score	+50	Every report starts here
+Image uploaded and valid	+20	File present, MIME valid, size ≤ 5 MB
+Nearby confirming report (within 200 m, < 48 h)	+15 per report	Capped at +30 total (max 2 reports)
+Proximity duplicate detected	−25	is_duplicate flagged true
+Image hash duplicate	−30	Exact hash match found
+Image too small (< 200×200 px)	−5	Low-quality evidence
+Invalid or out-of-range coordinates	−50	Effectively zeroes the report
+Description length < 10 characters	−10	Minimal user effort signal
+
+5.2 Implementation
+# services/verification.py (continued)
+
+def calculate_confidence(report_data, image_valid, image_small,
+                          image_duplicate, proximity_duplicate,
+                          nearby_confirming, db) -> int:
+    score = 50
+    if image_valid:                      score += 20
+    if image_small:                      score -=  5
+    if image_duplicate:                  score -= 30
+    if proximity_duplicate:              score -= 25
+    if len(report_data.description) < 10: score -= 10
+    if not coords_valid(report_data):    score -= 50
+
+    confirms = min(nearby_confirming, 2)
+    score += confirms * 15
+
+    return max(0, min(100, score))
+
+def coords_valid(data) -> bool:
+    return (-90 <= data.latitude <= 90) and (-180 <= data.longitude <= 180)
+
+6. API Query Parameter Definitions
+6.1  GET /reports
+Parameter	Type	Default	Description
+severity	string	null (all)	Filter by severity level: Low | Medium | High | Critical
+state	string	null (all)	Filter by state. Multiple values comma-separated: verified,investigating
+exclude_resolved	boolean	true	When true, omits resolved and rejected reports
+page	integer	1	Page number for pagination (1-indexed)
+limit	integer	50	Results per page. Maximum 200
+lat	float	null	Centre latitude for bounding-box filter
+lon	float	null	Centre longitude for bounding-box filter
+radius_km	float	null	Radius in km around lat/lon. Requires lat and lon
+
+Example: GET /reports?severity=High&state=verified,investigating&exclude_resolved=true&page=1&limit=20
+
+6.2  GET /heatmap
+Parameter	Type	Default	Description
+min_confidence	integer	40	Exclude reports below this confidence score
+max_age_days	integer	14	Exclude reports older than N days from the weight calculation
+include_resolved	boolean	false	If true, resolved reports are included at 10% weight
+
+6.3  GET /alerts
+Parameter	Type	Default	Description
+severity_min	string	High	Minimum severity to trigger alert. One of: Low | Medium | High | Critical
+lat	float	null	Filter alerts within radius of this point
+lon	float	null	Filter alerts within radius of this point
+radius_km	float	5.0	Radius for proximity filtering. Requires lat and lon
+
+6.4  GET /admin/reports
+Parameter	Type	Default	Description
+state	string	null (all)	Filter by any valid state value
+severity	string	null (all)	Filter by severity level
+is_duplicate	boolean	null (all)	Filter to show only duplicates or only originals
+is_verified	boolean	null (all)	Filter by verification status
+from_date	date (ISO 8601)	null	Inclusive start date for created_at range
+to_date	date (ISO 8601)	null	Inclusive end date for created_at range
+page	integer	1	Page number
+limit	integer	100	Results per page. Maximum 500
+sort_by	string	created_at	Column to sort: created_at | severity_score | confidence_score
+order	string	desc	Sort direction: asc | desc
+
+7. Clustering Algorithm
+7.1 Chosen Approach: Radius-Based Grouping (DBSCAN-lite)
+The system uses a simplified DBSCAN-style radius-based clustering algorithm without requiring scikit-learn. This is implementable in pure Python, stays fast for the expected report volumes (thousands, not millions), and produces clusters that map intuitively to geographic neighbourhoods.
+
+7.2 Parameters
+Parameter	Value	Rationale
+Cluster radius (epsilon)	200 metres	Covers a typical city block; tight enough to distinguish adjacent dump zones
+Minimum cluster size	3 reports	Below 3 is likely a single incident, not a recurring zone
+Distance metric	Haversine	Required for geographic (lat/lon) coordinates
+
+7.3 Algorithm
+# services/clustering.py
+
+CLUSTER_RADIUS_M = 200
+MIN_CLUSTER_SIZE = 3
+
+def cluster_reports(reports: list) -> list[dict]:
+"""
+    Returns a list of cluster dicts:
+      { centroid_lat, centroid_lon, report_ids, size, max_severity_score }
+"""
+    visited = set()
+    clusters = []
+
+    for i, r in enumerate(reports):
+        if i in visited:
+            continue
+        neighbours = [
+            j for j, s in enumerate(reports)
+            if j != i and
+            haversine_metres(r.latitude, r.longitude,
+                             s.latitude, s.longitude) <= CLUSTER_RADIUS_M
+        ]
+        if len(neighbours) + 1 < MIN_CLUSTER_SIZE:
+            continue  # noise point — not part of a cluster
+        members = [i] + neighbours
+        visited.update(members)
+        member_reports = [reports[m] for m in members]
+        clusters.append({
+"centroid_lat": sum(r.latitude  for r in member_reports) / len(member_reports),
+"centroid_lon": sum(r.longitude for r in member_reports) / len(member_reports),
+"report_ids":   [r.id for r in member_reports],
+"size":         len(member_reports),
+"max_severity": max(r.severity_score for r in member_reports),
+        })
+    return clusters
+
+8. Analytics Engine — Metric Definitions
+8.1 Metric Registry
+Every metric exposed by analytics_engine.py is defined below with its exact formula. All metrics are computed on-demand; there is no pre-aggregation cache in v1.
+
+Metric	Formula / Definition
+Top affected areas	Group active (non-expired, non-rejected) reports by cluster. Return top 10 clusters sorted by (size × average_severity_score) descending.
+Recurring hotspots	Clusters that have appeared in at least 3 distinct 7-day windows within the last 90 days. A cluster "appears" in a window if ≥ 3 reports fall within its centroid radius in that window.
+Report frequency (daily)	COUNT(reports) WHERE created_at >= NOW() - 30 days, grouped by calendar day. Returns a 30-point time series.
+Unresolved incident count	COUNT(reports) WHERE state NOT IN (resolved, rejected, expired).
+Avg. time to resolve (days)	AVG(updated_at - created_at) WHERE state = resolved AND updated_at IS NOT NULL. Excludes reports older than 90 days to avoid historical distortion.
+Cleanup efficiency rate (%)	(COUNT resolved / COUNT(resolved + expired + rejected)) × 100, over the last 30 days. Higher = more reports reaching resolution before expiry.
+Severity distribution	COUNT per severity level (Low / Medium / High / Critical) over all active reports. Returned as a percentage breakdown.
+Confidence distribution	Histogram of confidence_score in 10-point buckets (0-9, 10-19, ... 90-100) over all non-rejected reports.
+
+8.2 Analytics API Response Shape
+# GET /admin/analytics  →  JSON
+{
+"generated_at": "2026-05-18T14:32:00Z",
+"unresolved_count": 143,
+"cleanup_efficiency_pct": 61.4,
+"avg_resolve_days": 4.7,
+"severity_distribution": {
+"Low": 18.2, "Medium": 34.5, "High": 32.1, "Critical": 15.2
+  },
+"daily_frequency": [
+    { "date": "2026-04-19", "count": 12 },
+    ...
+  ],
+"top_areas": [
+    { "centroid_lat": 9.057, "centroid_lon": 7.495,
+"size": 30, "label": "Wuse Market", "score": 2700 },
+    ...
+  ],
+"recurring_hotspots": [ ... ]
+}
+
+9. Remaining Implementation Notes
+9.1 severity vs. severity_score Sync Rule
+severity_score is always derived deterministically from severity at write time. It is never set independently. This prevents the two fields from diverging.
+
+severity (string)	severity_score (integer)
+Low	20
+Medium	50
+High	80
+Critical	100
+
+# utils/constants.py
+SEVERITY_SCORES = { "Low": 20, "Medium": 50, "High": 80, "Critical": 100 }
+
+# Apply in report submission:
+report.severity_score = SEVERITY_SCORES[report.severity]
+
+9.2 updated_at Auto-Management
+# models.py
+from sqlalchemy import Column, DateTime, func
+
+updated_at = Column(
+    DateTime,
+    default=func.now(),
+    onupdate=func.now(),  # auto-updates on every row change
+    nullable=False,
+)
+
+9.3 Streamlit + FastAPI Co-deployment on Hugging Face Spaces
+Both services run in a single HF Space using a Procfile-style process manager. The recommended approach is supervisord.
+# supervisord.conf
+[program:fastapi]
+command=uvicorn main:app --host 0.0.0.0 --port 7860
+autostart=true
+
+[program:streamlit]
+command=streamlit run admin_dashboard/dashboard.py --server.port 7861
+autostart=true
+HF Spaces only exposes one public port (7860). The Streamlit admin dashboard at port 7861 must be accessed via a subdomain proxy or embedded as an iframe within the main Space — or deployed as a separate private Space with access restricted by HF org membership.
+
+Waste Management Backend  •  Supplementary Spec v1.0  •  May 2026
