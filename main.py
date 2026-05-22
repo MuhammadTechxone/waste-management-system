@@ -17,6 +17,9 @@ ALLOWED_ORIGINS = [
     "https://admin-dashboard.hf.space",
     "http://localhost:3000",
     "http://localhost:8501",
+    "http://127.0.0.1:5500", # Standard VS Code Live Server port
+    "http://localhost:5500",
+    "https://waste-management-system-1-6hie.onrender.com/report/", # Add your frontend URL here
 ]
 
 @asynccontextmanager
