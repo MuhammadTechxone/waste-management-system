@@ -19,7 +19,8 @@ ALLOWED_ORIGINS = [
     "http://localhost:8501",
     "http://127.0.0.1:5500", # Standard VS Code Live Server port
     "http://localhost:5500",
-    "https://waste-management-system-1-6hie.onrender.com/report/", # Add your frontend URL here
+    "file:///C:/mental_real_copy/index.html",
+    "null", 
 ]
 
 @asynccontextmanager
@@ -39,7 +40,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,  # Credentials require specific origins, not wildcards
+    allow_credentials=False, # Set to False for better compatibility with 'null' origins
     allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["Authorization", "Content-Type"],
 )
