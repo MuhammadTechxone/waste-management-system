@@ -1,27 +1,36 @@
+import os
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import models
 from api import reports, heatmap, admin, analytics, alerts
 from database import engine, SessionLocal
 from services.state_manager import expire_stale_reports
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Create database tables
 models.Base.metadata.create_all(bind=engine)
 
+# Ensure upload directory exists
+os.makedirs("uploads", exist_ok=True)
+
+# Get production URL from Render environment if available
+render_url = os.environ.get("RENDER_EXTERNAL_URL")
+
 ALLOWED_ORIGINS = [
-    # Replace with your actual HF Space production URLs as per Spec 1.3
-    "https://user-facing-frontend.hf.space",
-    "https://admin-dashboard.hf.space",
     "http://localhost:3000",
     "http://localhost:8501",
     "http://127.0.0.1:5500", # Standard VS Code Live Server port
     "http://localhost:5500",
-    "file:///C:/mental_real_copy/index.html",
     "null", 
 ]
+if render_url:
+    ALLOWED_ORIGINS.append(render_url)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -36,6 +45,9 @@ app = FastAPI(
     title="Waste Management Monitoring System API",
     lifespan=lifespan
 )
+
+# Mount the uploads directory to serve images at /uploads
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 app.add_middleware(
     CORSMiddleware,

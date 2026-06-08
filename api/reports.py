@@ -28,6 +28,10 @@ async def submit_report(
     image: UploadFile = File(None),
     db: Session = Depends(get_db)
 ):
+    # 0. Coordinate Validation (Spec Section 5.2)
+    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
+        raise HTTPException(status_code=422, detail="Invalid GPS coordinates")
+
     # 1. Basic validation
     if severity not in SEVERITY_SCORES:
         raise HTTPException(status_code=400, detail="Invalid severity level")
