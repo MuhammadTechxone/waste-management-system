@@ -23,6 +23,7 @@ os.makedirs("uploads", exist_ok=True)
 render_url = os.environ.get("RENDER_EXTERNAL_URL")
 
 ALLOWED_ORIGINS = [
+    "https://waste-management-system-9zjg.onrender.com",
     "http://localhost:3000",
     "http://localhost:8501",
     "http://127.0.0.1:5500", # Standard VS Code Live Server port
