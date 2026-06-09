@@ -21,7 +21,7 @@ def get_heatmap_points(db: Session, min_confidence: int, max_age_days: int, incl
     
     for r in reports:
         # 2. Calculate Base Weight from Severity
-        weight = float(r.severity_score)
+        weight = (float(r.severity_score) * float(r.confidence_score)) / 100.0
         
         # 3. Apply operational modifiers
         if r.state == "resolved":

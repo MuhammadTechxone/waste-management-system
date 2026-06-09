@@ -61,7 +61,7 @@ app.add_middleware(
 def auto_expiry_job():
     """Task to move stale reports to expired state (Spec Section 3.3)."""
     db = SessionLocal()
-    try:
+    try: # Use a new session for the background job
         count = expire_stale_reports(db)
         if count > 0:
             print(f"[{datetime.now()}] Background Job: Expired {count} reports.")
