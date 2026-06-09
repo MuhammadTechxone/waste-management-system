@@ -5,3 +5,5 @@ pydantic
 python-multipart
 apscheduler
 python-dotenv
+Pillow
+python-dotenv

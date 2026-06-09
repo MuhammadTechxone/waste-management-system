@@ -3,10 +3,10 @@ import uuid
 from datetime import date
 from typing import List, Optional
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, Query
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session # Import ReportResponse
 from database import get_db
 from models import Report
-from schemas import ReportResponse
+from schemas import ReportResponse # Import ReportResponse
 from constants import SEVERITY_SCORES
 from services.verification import (
     get_image_hash, check_duplicates, haversine_metres,
@@ -40,6 +40,7 @@ async def submit_report(
     img_path = None
     img_hash = None
     file_content = None
+    image_small = False # Initialize image_small
     
     if image:
         file_content = await image.read()
@@ -47,6 +48,15 @@ async def submit_report(
         if len(file_content) > 5 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="Image too large")
         
+        # Validate MIME type (Spec Section 2.2) # TODO: Implement image dimension check (200x200px) and set image_small accordingly
+        allowed_types = ["image/jpeg", "image/png", "image/webp"]
+        if image.content_type not in allowed_types:
+            raise HTTPException(status_code=422, detail="Unsupported image format")
+
+        # Implement image dimension check (200x200px) and set image_small accordingly
+        if not check_image_dimensions(file_content):
+            image_small = True
+
         img_hash = get_image_hash(file_content)
         
         # Save to disk
@@ -68,6 +78,7 @@ async def submit_report(
     conf_score = calculate_confidence(
         latitude, longitude, description, 
         has_image=(image is not None),
+        image_small=image_small, # Pass image_small status
         hash_dup=hash_dup,
         proximity_dup=proximity_dup,
         confirmations=confirmations
@@ -87,12 +98,17 @@ async def submit_report(
     db.commit()
     db.refresh(new_report)
     
+    # Construct image_url only if an image was uploaded
+    image_url = None
+    if img_path:
+        image_url = f"/uploads/{today_str}/{filename}"
+
     return {
         "success": True,
         "report_id": new_report.id,
-        "severity": new_report.severity,
-        "state": new_report.state,
-        "confidence_score": new_report.confidence_score
+        "image_url": image_url, # Return the full URL for the frontend
+        "confidence_score": new_report.confidence_score,
+        "state": new_report.state
     }
 
 @router.get("/", response_model=List[ReportResponse])
