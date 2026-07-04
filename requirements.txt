@@ -1,9 +1,31 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-pydantic
-python-multipart
-apscheduler
-python-dotenv
-Pillow
-google-generativeai
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+sqlalchemy==2.0.23
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+apscheduler==3.10.4
+python-dotenv==1.0.0
+Pillow==10.1.0
+google-generativeai==0.3.0
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+httpx==0.25.1
+
+# Security & Rate Limiting
+slowapi==0.1.9
+
+# Logging
+python-json-logger==2.0.7
+
+# Database Migrations
+alembic==1.13.0
+psycopg2-binary==2.9.9
+
+# Code Quality
+mypy==1.7.1
+black==23.12.0
+flake8==6.1.0
+isort==5.13.2
