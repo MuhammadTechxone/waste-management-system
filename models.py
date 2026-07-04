@@ -15,6 +15,9 @@ class Report(Base):
     description = Column(Text, nullable=False)
     
     waste_type = Column(String, nullable=True)
+    ai_classification = Column(String, nullable=True)
+    ai_significance_score = Column(Integer, nullable=True)
+    
     severity = Column(String, nullable=False)
     severity_score = Column(Integer, default=20)
     

@@ -3,7 +3,7 @@ import math
 from datetime import datetime, timedelta
 import io # Added import for io
 from sqlalchemy.orm import Session
-import math
+from constants import SEVERITY_SCORES
 from models import Report
 
 PROXIMITY_METRES = 50
@@ -64,12 +64,28 @@ def count_nearby_confirmations(db: Session, lat: float, lon: float) -> int:
 def calculate_confidence( # Added image_small parameter
     lat: float, lon: float, description: str,
     has_image: bool, image_small: bool, hash_dup: bool, proximity_dup: bool,
-    confirmations: int
+    confirmations: int, user_severity: str, ai_result: dict = None
 ) -> int:
     """Applies the scoring formula from Spec Section 5.1."""
     score = 50 # Base
     
-    if has_image: score += 20
+    if has_image: 
+        score += 20
+    
+    # Nigerian Context: High priority for drainage issues
+    if "drain" in description.lower() or "block" in description.lower():
+        score += 10
+    
+    if ai_result:
+        # AI Confirmation: AI agrees it's valid waste
+        if ai_result.get("is_valid_waste"): score += 20
+        
+        # AI Conflict logic: 
+        # If user severity is 'Critical' (100) but AI score is low (< 30)
+        user_val = SEVERITY_SCORES.get(user_severity, 20)
+        if user_val >= 80 and ai_result.get("significance_score", 0) < 30:
+            score -= 30  # Major Conflict Penalty
+
     if image_small: score -= 5 # Apply penalty for small image
     if hash_dup: score -= 30
     if proximity_dup: score -= 25

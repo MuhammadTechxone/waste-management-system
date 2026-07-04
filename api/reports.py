@@ -9,6 +9,7 @@ from database import get_db # Ensure this matches your project structure
 from models import Report
 from schemas import ReportResponse
 from constants import SEVERITY_SCORES
+from services.ai_classifier import classify_waste_significance
 from services.verification import (
     get_image_hash, check_duplicates, haversine_metres,
     count_nearby_confirmations, calculate_confidence,
@@ -74,19 +75,28 @@ async def submit_report(
         with open(img_path, "wb") as f:
             f.write(file_content)
 
+    # 2.5 AI Classification (Run if image is present)
+    ai_result = None
+    if img_path:
+        try:
+            ai_result = classify_waste_significance(img_path, description)
+        except Exception as e:
+            print(f"AI Classification failed: {e}")
+            ai_result = None # Fallback to manual scoring
+
     # 3. Verification Logic
     hash_dup, proximity_dup = check_duplicates(db, latitude, longitude, img_hash)
     confirmations = count_nearby_confirmations(db, latitude, longitude)
     
     conf_score = calculate_confidence(
-        lat=latitude,
-        lon=longitude,
-        description=description,
+        lat=latitude, lon=longitude, description=description,
         has_image=(image is not None),
         image_small=image_small,
         hash_dup=hash_dup,
         proximity_dup=proximity_dup,
-        confirmations=confirmations
+        confirmations=confirmations,
+        user_severity=severity,
+        ai_result=ai_result
     )
 
     # 4. Create Database Record
@@ -96,7 +106,9 @@ async def submit_report(
         severity=severity, severity_score=SEVERITY_SCORES[severity],
         reporter_id=reporter_id, image_path=img_path, image_hash=img_hash,
         is_duplicate=(hash_dup or proximity_dup),
-        confidence_score=conf_score
+        confidence_score=conf_score,
+        ai_classification=ai_result.get("classification") if ai_result else None,
+        ai_significance_score=ai_result.get("significance_score") if ai_result else None
     )
     
     db.add(new_report)
